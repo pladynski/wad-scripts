@@ -1,0 +1,29 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Open Graftcode",
+      "type": "shell",
+      "command": "echo ${input:graftcodeBrowser} >/dev/null || true",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "never",
+        "echo": false,
+        "focus": false,
+        "panel": "shared",
+        "close": true
+      },
+      "runOptions": {
+        "runOn": "folderOpen"
+      }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "graftcodeBrowser",
+      "type": "command",
+      "command": "simpleBrowser.api.open",
+      "args": ["https://wad.graftcode.com"]
+    }
+  ]
+}
