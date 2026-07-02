@@ -109,7 +109,164 @@ function Copy-ChallengeTemplate {
     }
 
     Copy-Item -Path (Join-Path $ChallengeTemplate '*') -Destination $WorkDir -Recurse -Force
+    Set-CursorWorkspaceSettings -Directory $WorkDir
     Write-Host 'Workspace template ready.' -ForegroundColor Green
+}
+
+function Write-Utf8TextFile {
+    param(
+        [string]$Path,
+        [string]$Content
+    )
+
+    $parent = Split-Path $Path -Parent
+    if ($parent -and -not (Test-Path $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+
+    [System.IO.File]::WriteAllText($Path, $Content, [System.Text.UTF8Encoding]::new($false))
+}
+
+function Get-PythonLauncher {
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        return @{ Command = 'py'; PrefixArgs = @('-3') }
+    }
+    if (Get-Command python -ErrorAction SilentlyContinue) {
+        return @{ Command = 'python'; PrefixArgs = @() }
+    }
+    if (Get-Command python3 -ErrorAction SilentlyContinue) {
+        return @{ Command = 'python3'; PrefixArgs = @() }
+    }
+
+    return $null
+}
+
+function Update-JsonSettingsFile {
+    param(
+        [string]$Path,
+        [ValidateSet('cursor', 'vscode', 'workspace')]
+        [string]$Scope,
+        [string]$WindowDimensions = 'maximized'
+    )
+
+    $parent = Split-Path $Path -Parent
+    if ($parent -and -not (Test-Path $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+
+    $python = Get-PythonLauncher
+    if ($python) {
+        $env:SETTINGS_FILE = $Path
+        $env:SCOPE = $Scope
+        $env:WINDOW_DIMENSIONS = $WindowDimensions
+        $env:CHAT_MAX_WIDTH = [string]$CursorChatMaxWidth
+
+        $pyScript = @'
+import json
+import os
+import re
+
+path = os.environ["SETTINGS_FILE"]
+scope = os.environ["SCOPE"]
+
+
+def load_settings(text):
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
+    text = text.strip()
+    if not text:
+        return {}
+    return json.loads(text)
+
+
+data = {}
+if os.path.isfile(path):
+    with open(path, encoding="utf-8") as f:
+        data = load_settings(f.read())
+
+if scope == "workspace":
+    data["task.allowAutomaticTasks"] = "on"
+
+if scope != "workspace":
+    data["window.newWindowDimensions"] = os.environ["WINDOW_DIMENSIONS"]
+
+if scope in ("cursor", "workspace"):
+    data["cursor.chatMaxWidth"] = int(os.environ["CHAT_MAX_WIDTH"])
+
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=4)
+    f.write("\n")
+'@
+
+        $pyFile = [System.IO.Path]::GetTempFileName() + '.py'
+        try {
+            Write-Utf8TextFile -Path $pyFile -Content $pyScript
+            & $python.Command @($python.PrefixArgs + $pyFile) | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw "Python settings update failed with exit code $LASTEXITCODE"
+            }
+        }
+        finally {
+            Remove-Item Env:SETTINGS_FILE, Env:SCOPE, Env:WINDOW_DIMENSIONS, Env:CHAT_MAX_WIDTH -ErrorAction SilentlyContinue
+            if (Test-Path $pyFile) {
+                Remove-Item -LiteralPath $pyFile -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        return
+    }
+
+    $content = if (Test-Path $Path) { [System.IO.File]::ReadAllText($Path) } else { '{}' }
+    $content = $content.Trim()
+    if (-not $content) { $content = '{}' }
+
+    if ($Scope -eq 'workspace') {
+        $content = Set-JsonSettingValue -Content $content -Key 'task.allowAutomaticTasks' -Value 'on'
+    }
+
+    if ($Scope -ne 'workspace') {
+        $content = Set-JsonSettingValue -Content $content -Key 'window.newWindowDimensions' -Value $WindowDimensions
+    }
+
+    if ($Scope -in @('cursor', 'workspace')) {
+        $content = Set-JsonSettingValue -Content $content -Key 'cursor.chatMaxWidth' -Value ([string]$CursorChatMaxWidth) -IsNumber
+    }
+
+    Write-Utf8TextFile -Path $Path -Content ($content.TrimEnd() + [Environment]::NewLine)
+}
+
+function Set-JsonSettingValue {
+    param(
+        [string]$Content,
+        [string]$Key,
+        [string]$Value,
+        [switch]$IsNumber
+    )
+
+    $escapedKey = [regex]::Escape($Key)
+    $replacement = if ($IsNumber) { "`"$Key`": $Value" } else { "`"$Key`": `"$Value`"" }
+
+    if ($Content -match "`"$escapedKey`"\s*:") {
+        if ($IsNumber) {
+            return [regex]::Replace($Content, "`"$escapedKey`"\s*:\s*[^,\r\n\}]+", $replacement)
+        }
+
+        return [regex]::Replace($Content, "`"$escapedKey`"\s*:\s*`"[^`"]*`"", $replacement)
+    }
+
+    $entry = "  $replacement"
+    if ($Content -match '^\{\s*\}$') {
+        return "{`r`n$entry`r`n}"
+    }
+
+    return [regex]::Replace($Content, '\}\s*$', ",`r`n$entry`r`n}")
+}
+
+function Set-CursorWorkspaceSettings {
+    param([string]$Directory)
+
+    $settingsFile = Join-Path $Directory '.vscode\settings.json'
+    Update-JsonSettingsFile -Path $settingsFile -Scope workspace
 }
 
 function Set-DistributedWorkspace {
@@ -133,11 +290,7 @@ function Set-DistributedWorkspace {
     $vscodeDir = Join-Path $WorkDir '.vscode'
     New-Item -ItemType Directory -Path $vscodeDir -Force | Out-Null
 
-    @'
-{
-  "task.allowAutomaticTasks": "on"
-}
-'@ | Set-Content -Path (Join-Path $vscodeDir 'settings.json') -Encoding UTF8
+    Update-JsonSettingsFile -Path (Join-Path $vscodeDir 'settings.json') -Scope workspace
 
     $gitBash = @(
         (Join-Path ${env:ProgramFiles} 'Git\bin\bash.exe'),
@@ -285,31 +438,10 @@ function Set-IdeUserSettings {
         Join-Path $env:APPDATA 'Code\User\settings.json'
     }
 
-    $parent = Split-Path $settingsFile -Parent
-    if ($parent -and -not (Test-Path $parent)) {
-        New-Item -ItemType Directory -Path $parent -Force | Out-Null
-    }
-
     Write-Host ''
     Write-Host "Configuring $TargetIde window settings..."
 
-    $settings = @{}
-    if (Test-Path $settingsFile) {
-        $raw = Get-Content -Path $settingsFile -Raw -Encoding UTF8
-        $jsonText = $raw -replace '(?ms)/\*.*?\*/', '' -replace '(?m)//[^\r\n]*', ''
-        if ($jsonText.Trim()) {
-            ($jsonText | ConvertFrom-Json).PSObject.Properties | ForEach-Object {
-                $settings[$_.Name] = $_.Value
-            }
-        }
-    }
-
-    $settings['window.newWindowDimensions'] = 'maximized'
-    if ($TargetIde -eq 'cursor') {
-        $settings['cursor.chatMaxWidth'] = $CursorChatMaxWidth
-    }
-
-    ($settings | ConvertTo-Json -Depth 10) + [Environment]::NewLine | Set-Content -Path $settingsFile -Encoding UTF8
+    Update-JsonSettingsFile -Path $settingsFile -Scope $TargetIde -WindowDimensions 'maximized'
 
     Write-Host "Set window.newWindowDimensions to maximized in $TargetIde settings." -ForegroundColor Green
     if ($TargetIde -eq 'cursor') {

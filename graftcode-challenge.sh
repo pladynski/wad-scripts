@@ -117,7 +117,43 @@ copy_challenge_template() {
   fi
 
   cp -R "${CHALLENGE_TEMPLATE}/." "$WORK_DIR/"
+  write_cursor_workspace_settings "$WORK_DIR"
   echo -e "${GREEN}Workspace template ready.${NC}"
+}
+
+write_cursor_workspace_settings() {
+  local work_dir="$1"
+
+  mkdir -p "${work_dir}/.vscode"
+
+  WORK_DIR="$work_dir" CHAT_MAX_WIDTH="$CURSOR_CHAT_MAX_WIDTH" python3 <<'PY'
+import json
+import os
+import re
+
+path = os.path.join(os.environ["WORK_DIR"], ".vscode", "settings.json")
+
+
+def load_settings(text):
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
+    text = text.strip()
+    if not text:
+        return {}
+    return json.loads(text)
+
+
+data = {}
+if os.path.isfile(path):
+    with open(path, encoding="utf-8") as f:
+        data = load_settings(f.read())
+
+data["cursor.chatMaxWidth"] = int(os.environ["CHAT_MAX_WIDTH"])
+
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=4)
+    f.write("\n")
+PY
 }
 
 setup_distributed_workspace() {
@@ -137,9 +173,10 @@ setup_distributed_workspace() {
 
   mkdir -p "${WORK_DIR}/.vscode"
 
-  cat > "${WORK_DIR}/.vscode/settings.json" <<'JSON'
+  cat > "${WORK_DIR}/.vscode/settings.json" <<JSON
 {
-  "task.allowAutomaticTasks": "on"
+  "task.allowAutomaticTasks": "on",
+  "cursor.chatMaxWidth": ${CURSOR_CHAT_MAX_WIDTH}
 }
 JSON
 
