@@ -181,7 +181,7 @@ def load_settings(text):
 
 data = {}
 if os.path.isfile(path):
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8-sig") as f:
         data = load_settings(f.read())
 
 if scope == "workspace":
