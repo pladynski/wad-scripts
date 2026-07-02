@@ -7,7 +7,7 @@ CHALLENGE_TEMPLATE="${SCRIPT_DIR}/templates/graftcode-challenge"
 GRAFTCODE_URL="https://wad.graftcode.com"
 WAD_KNOWLEDGE_REPO="https://github.com/pladynski/wad-knowledge"
 WORKSPACE_METADATA_CLEANUP_DELAY=10
-CURSOR_CHAT_MAX_WIDTH=400
+CURSOR_CHAT_PANEL_WIDTH=400
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -117,43 +117,7 @@ copy_challenge_template() {
   fi
 
   cp -R "${CHALLENGE_TEMPLATE}/." "$WORK_DIR/"
-  write_cursor_workspace_settings "$WORK_DIR"
   echo -e "${GREEN}Workspace template ready.${NC}"
-}
-
-write_cursor_workspace_settings() {
-  local work_dir="$1"
-
-  mkdir -p "${work_dir}/.vscode"
-
-  WORK_DIR="$work_dir" CHAT_MAX_WIDTH="$CURSOR_CHAT_MAX_WIDTH" python3 <<'PY'
-import json
-import os
-import re
-
-path = os.path.join(os.environ["WORK_DIR"], ".vscode", "settings.json")
-
-
-def load_settings(text):
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
-    text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
-    text = text.strip()
-    if not text:
-        return {}
-    return json.loads(text)
-
-
-data = {}
-if os.path.isfile(path):
-    with open(path, encoding="utf-8-sig") as f:
-        data = load_settings(f.read())
-
-data["cursor.chatMaxWidth"] = int(os.environ["CHAT_MAX_WIDTH"])
-
-with open(path, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=4)
-    f.write("\n")
-PY
 }
 
 setup_distributed_workspace() {
@@ -173,10 +137,9 @@ setup_distributed_workspace() {
 
   mkdir -p "${WORK_DIR}/.vscode"
 
-  cat > "${WORK_DIR}/.vscode/settings.json" <<JSON
+  cat > "${WORK_DIR}/.vscode/settings.json" <<'JSON'
 {
-  "task.allowAutomaticTasks": "on",
-  "cursor.chatMaxWidth": ${CURSOR_CHAT_MAX_WIDTH}
+  "task.allowAutomaticTasks": "on"
 }
 JSON
 
@@ -283,7 +246,7 @@ configure_ide_settings() {
 
   mkdir -p "$(dirname "$settings_file")"
 
-  SETTINGS_FILE="$settings_file" CHAT_MAX_WIDTH="$CURSOR_CHAT_MAX_WIDTH" IDE="$ide" python3 <<'PY'
+  SETTINGS_FILE="$settings_file" IDE="$ide" python3 <<'PY'
 import json
 import os
 import re
@@ -308,7 +271,7 @@ if os.path.isfile(path):
 
 data["window.newWindowDimensions"] = "fullscreen"
 if ide == "cursor":
-    data["cursor.chatMaxWidth"] = int(os.environ["CHAT_MAX_WIDTH"])
+    data.pop("cursor.chatMaxWidth", None)
 
 with open(path, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=4)
@@ -316,9 +279,69 @@ with open(path, "w", encoding="utf-8") as f:
 PY
 
   echo -e "${GREEN}Set window.newWindowDimensions to fullscreen in ${ide} settings.${NC}"
-  if [[ "$ide" == "cursor" ]]; then
-    echo -e "${GREEN}Set cursor.chatMaxWidth to ${CURSOR_CHAT_MAX_WIDTH} in Cursor settings.${NC}"
+}
+
+configure_cursor_chat_panel_width() {
+  local state_db="${HOME}/Library/Application Support/Cursor/User/globalStorage/state.vscdb"
+
+  if [[ ! -f "$state_db" ]]; then
+    echo -e "${YELLOW}Cursor state database not found — skipping chat panel width.${NC}"
+    return 0
   fi
+
+  echo
+  echo -e "${BOLD}Configuring Cursor chat panel width...${NC}"
+
+  STATE_DB="$state_db" PANEL_WIDTH="$CURSOR_CHAT_PANEL_WIDTH" python3 <<'PY'
+import json
+import os
+import sqlite3
+
+db_path = os.environ["STATE_DB"]
+width = int(os.environ["PANEL_WIDTH"])
+
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+
+
+def upsert(key, value):
+    cur.execute(
+        "INSERT INTO ItemTable (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+
+
+upsert("workbench.auxiliaryBar.size", str(width))
+
+cur.execute("SELECT value FROM ItemTable WHERE key = ?", ("agentLayout.shared.v6",))
+row = cur.fetchone()
+if row:
+    try:
+        layout = json.loads(row[0])
+    except json.JSONDecodeError:
+        layout = {}
+    if not isinstance(layout, dict):
+        layout = {}
+    layout["auxiliaryBarWidth"] = width
+    layout["auxiliaryBarVisible"] = True
+    upsert("agentLayout.shared.v6", json.dumps(layout, separators=(",", ":")))
+else:
+    layout = {
+        "auxiliaryBarVisible": True,
+        "auxiliaryBarWidth": width,
+        "editorVisible": True,
+        "panelVisible": False,
+        "sidebarVisible": True,
+        "statusBarVisible": True,
+    }
+    upsert("agentLayout.shared.v6", json.dumps(layout, separators=(",", ":")))
+
+conn.commit()
+conn.close()
+PY
+
+  echo -e "${GREEN}Set Cursor chat panel width to ${CURSOR_CHAT_PANEL_WIDTH}px.${NC}"
 }
 
 fullscreen_ide_window() {
@@ -508,6 +531,9 @@ run_challenge() {
   cleanup_mcp
   cleanup_browser_cookies
   configure_ide_settings "$IDE"
+  if [[ "$IDE" == "cursor" ]]; then
+    configure_cursor_chat_panel_width
+  fi
   copy_challenge_template
   launch_challenge "$ide_cmd"
 }
@@ -518,6 +544,7 @@ run_distributed() {
   cleanup_mcp
   cleanup_browser_cookies
   configure_ide_settings "cursor"
+  configure_cursor_chat_panel_width
   setup_distributed_workspace
   launch_distributed
 }

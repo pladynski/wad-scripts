@@ -6,7 +6,7 @@ $ChallengeTemplate = Join-Path $ScriptDir 'templates\graftcode-challenge'
 $GraftcodeUrl = 'https://wad.graftcode.com'
 $WadKnowledgeRepo = 'https://github.com/pladynski/wad-knowledge'
 $WorkspaceMetadataCleanupDelay = 10
-$CursorChatMaxWidth = 400
+$CursorChatPanelWidth = 400
 
 $Mode = ''
 $Ide = ''
@@ -109,7 +109,6 @@ function Copy-ChallengeTemplate {
     }
 
     Copy-Item -Path (Join-Path $ChallengeTemplate '*') -Destination $WorkDir -Recurse -Force
-    Set-CursorWorkspaceSettings -Directory $WorkDir
     Write-Host 'Workspace template ready.' -ForegroundColor Green
 }
 
@@ -159,7 +158,6 @@ function Update-JsonSettingsFile {
         $env:SETTINGS_FILE = $Path
         $env:SCOPE = $Scope
         $env:WINDOW_DIMENSIONS = $WindowDimensions
-        $env:CHAT_MAX_WIDTH = [string]$CursorChatMaxWidth
 
         $pyScript = @'
 import json
@@ -190,8 +188,8 @@ if scope == "workspace":
 if scope != "workspace":
     data["window.newWindowDimensions"] = os.environ["WINDOW_DIMENSIONS"]
 
-if scope in ("cursor", "workspace"):
-    data["cursor.chatMaxWidth"] = int(os.environ["CHAT_MAX_WIDTH"])
+if scope == "cursor":
+    data.pop("cursor.chatMaxWidth", None)
 
 with open(path, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=4)
@@ -207,7 +205,7 @@ with open(path, "w", encoding="utf-8") as f:
             }
         }
         finally {
-            Remove-Item Env:SETTINGS_FILE, Env:SCOPE, Env:WINDOW_DIMENSIONS, Env:CHAT_MAX_WIDTH -ErrorAction SilentlyContinue
+            Remove-Item Env:SETTINGS_FILE, Env:SCOPE, Env:WINDOW_DIMENSIONS -ErrorAction SilentlyContinue
             if (Test-Path $pyFile) {
                 Remove-Item -LiteralPath $pyFile -Force -ErrorAction SilentlyContinue
             }
@@ -226,10 +224,6 @@ with open(path, "w", encoding="utf-8") as f:
 
     if ($Scope -ne 'workspace') {
         $content = Set-JsonSettingValue -Content $content -Key 'window.newWindowDimensions' -Value $WindowDimensions
-    }
-
-    if ($Scope -in @('cursor', 'workspace')) {
-        $content = Set-JsonSettingValue -Content $content -Key 'cursor.chatMaxWidth' -Value ([string]$CursorChatMaxWidth) -IsNumber
     }
 
     Write-Utf8TextFile -Path $Path -Content ($content.TrimEnd() + [Environment]::NewLine)
@@ -262,11 +256,90 @@ function Set-JsonSettingValue {
     return [regex]::Replace($Content, '\}\s*$', ",`r`n$entry`r`n}")
 }
 
-function Set-CursorWorkspaceSettings {
-    param([string]$Directory)
+function Set-CursorChatPanelWidth {
+    $stateDb = Join-Path $env:APPDATA 'Cursor\User\globalStorage\state.vscdb'
+    if (-not (Test-Path $stateDb)) {
+        Write-Host 'Cursor state database not found — skipping chat panel width.' -ForegroundColor Yellow
+        return
+    }
 
-    $settingsFile = Join-Path $Directory '.vscode\settings.json'
-    Update-JsonSettingsFile -Path $settingsFile -Scope workspace
+    Write-Host ''
+    Write-Host 'Configuring Cursor chat panel width...'
+
+    $python = Get-PythonLauncher
+    if (-not $python) {
+        Write-Host 'Python not found — cannot set Cursor chat panel width.' -ForegroundColor Yellow
+        return
+    }
+
+    $env:STATE_DB = $stateDb
+    $env:PANEL_WIDTH = [string]$CursorChatPanelWidth
+
+    $pyScript = @'
+import json
+import os
+import sqlite3
+
+db_path = os.environ["STATE_DB"]
+width = int(os.environ["PANEL_WIDTH"])
+
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+
+
+def upsert(key, value):
+    cur.execute(
+        "INSERT INTO ItemTable (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+
+
+upsert("workbench.auxiliaryBar.size", str(width))
+
+cur.execute("SELECT value FROM ItemTable WHERE key = ?", ("agentLayout.shared.v6",))
+row = cur.fetchone()
+if row:
+    try:
+        layout = json.loads(row[0])
+    except json.JSONDecodeError:
+        layout = {}
+    if not isinstance(layout, dict):
+        layout = {}
+    layout["auxiliaryBarWidth"] = width
+    layout["auxiliaryBarVisible"] = True
+    upsert("agentLayout.shared.v6", json.dumps(layout, separators=(",", ":")))
+else:
+    layout = {
+        "auxiliaryBarVisible": True,
+        "auxiliaryBarWidth": width,
+        "editorVisible": True,
+        "panelVisible": False,
+        "sidebarVisible": True,
+        "statusBarVisible": True,
+    }
+    upsert("agentLayout.shared.v6", json.dumps(layout, separators=(",", ":")))
+
+conn.commit()
+conn.close()
+'@
+
+    $pyFile = [System.IO.Path]::GetTempFileName() + '.py'
+    try {
+        Write-Utf8TextFile -Path $pyFile -Content $pyScript
+        & $python.Command @($python.PrefixArgs + $pyFile) | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Python state update failed with exit code $LASTEXITCODE"
+        }
+    }
+    finally {
+        Remove-Item Env:STATE_DB, Env:PANEL_WIDTH -ErrorAction SilentlyContinue
+        if (Test-Path $pyFile) {
+            Remove-Item -LiteralPath $pyFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Write-Host "Set Cursor chat panel width to $CursorChatPanelWidth px." -ForegroundColor Green
 }
 
 function Set-DistributedWorkspace {
@@ -444,9 +517,6 @@ function Set-IdeUserSettings {
     Update-JsonSettingsFile -Path $settingsFile -Scope $TargetIde -WindowDimensions 'maximized'
 
     Write-Host "Set window.newWindowDimensions to maximized in $TargetIde settings." -ForegroundColor Green
-    if ($TargetIde -eq 'cursor') {
-        Write-Host "Set cursor.chatMaxWidth to $CursorChatMaxWidth in Cursor settings." -ForegroundColor Green
-    }
 }
 
 function Start-MaximizeIdeWindow {
@@ -598,6 +668,9 @@ function Invoke-Challenge {
     Clear-Mcp
     Clear-BrowserCookies
     Set-IdeUserSettings -TargetIde $Ide
+    if ($Ide -eq 'cursor') {
+        Set-CursorChatPanelWidth
+    }
     Copy-ChallengeTemplate
     Start-ChallengeIde -IdeCmd $ideCmd
 }
@@ -608,6 +681,7 @@ function Invoke-Distributed {
     Clear-Mcp
     Clear-BrowserCookies
     Set-IdeUserSettings -TargetIde 'cursor'
+    Set-CursorChatPanelWidth
     Set-DistributedWorkspace
     Start-DistributedIde
 }
