@@ -5,6 +5,8 @@ $ScriptDir = $PSScriptRoot
 $ChallengeTemplate = Join-Path $ScriptDir 'templates\graftcode-challenge'
 $GraftcodeUrl = 'https://wad.graftcode.com'
 $WadKnowledgeRepo = 'https://github.com/pladynski/wad-knowledge'
+$WorkspaceMetadataCleanupDelay = 10
+$CursorChatMaxWidth = 400
 
 $Mode = ''
 $Ide = ''
@@ -270,6 +272,96 @@ function Clear-Mcp {
     Write-Host 'MCP configuration cleared in Cursor and Visual Studio Code.' -ForegroundColor Green
 }
 
+function Set-IdeUserSettings {
+    param(
+        [ValidateSet('cursor', 'vscode')]
+        [string]$TargetIde
+    )
+
+    $settingsFile = if ($TargetIde -eq 'cursor') {
+        Join-Path $env:APPDATA 'Cursor\User\settings.json'
+    }
+    else {
+        Join-Path $env:APPDATA 'Code\User\settings.json'
+    }
+
+    $parent = Split-Path $settingsFile -Parent
+    if ($parent -and -not (Test-Path $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+
+    Write-Host ''
+    Write-Host "Configuring $TargetIde window settings..."
+
+    $settings = @{}
+    if (Test-Path $settingsFile) {
+        $raw = Get-Content -Path $settingsFile -Raw -Encoding UTF8
+        $jsonText = $raw -replace '(?ms)/\*.*?\*/', '' -replace '(?m)//[^\r\n]*', ''
+        if ($jsonText.Trim()) {
+            ($jsonText | ConvertFrom-Json).PSObject.Properties | ForEach-Object {
+                $settings[$_.Name] = $_.Value
+            }
+        }
+    }
+
+    $settings['window.newWindowDimensions'] = 'maximized'
+    if ($TargetIde -eq 'cursor') {
+        $settings['cursor.chatMaxWidth'] = $CursorChatMaxWidth
+    }
+
+    ($settings | ConvertTo-Json -Depth 10) + [Environment]::NewLine | Set-Content -Path $settingsFile -Encoding UTF8
+
+    Write-Host "Set window.newWindowDimensions to maximized in $TargetIde settings." -ForegroundColor Green
+    if ($TargetIde -eq 'cursor') {
+        Write-Host "Set cursor.chatMaxWidth to $CursorChatMaxWidth in Cursor settings." -ForegroundColor Green
+    }
+}
+
+function Start-MaximizeIdeWindow {
+    param(
+        [ValidateSet('cursor', 'vscode')]
+        [string]$TargetIde
+    )
+
+    $processName = if ($TargetIde -eq 'cursor') { 'Cursor' } else { 'Code' }
+
+    Start-Job -ScriptBlock {
+        param($Name)
+
+        Start-Sleep -Seconds 2
+
+        if (-not ('NativeMethods' -as [type])) {
+            Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class NativeMethods {
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    public const int SW_MAXIMIZE = 3;
+}
+'@
+        }
+
+        for ($attempt = 0; $attempt -lt 3; $attempt++) {
+            for ($i = 0; $i -lt 40; $i++) {
+                $proc = Get-Process -Name $Name -ErrorAction SilentlyContinue |
+                    Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } |
+                    Sort-Object StartTime -Descending |
+                    Select-Object -First 1
+
+                if ($proc) {
+                    [NativeMethods]::ShowWindow($proc.MainWindowHandle, [NativeMethods]::SW_MAXIMIZE) | Out-Null
+                    break
+                }
+
+                Start-Sleep -Milliseconds 250
+            }
+
+            Start-Sleep -Seconds 1
+        }
+    } -ArgumentList $processName | Out-Null
+}
+
 function Stop-IdeIfRunning {
     param([string[]]$ProcessNames)
 
@@ -313,6 +405,20 @@ function Clear-BrowserCookies {
     }
 }
 
+function Schedule-WorkspaceMetadataCleanup {
+    param([string]$Directory)
+
+    $delay = $WorkspaceMetadataCleanupDelay
+    Start-Job -ScriptBlock {
+        param($WorkDirectory, $Seconds)
+        Start-Sleep -Seconds $Seconds
+        $vscode = Join-Path $WorkDirectory '.vscode'
+        if (Test-Path $vscode) {
+            Remove-Item -LiteralPath $vscode -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    } -ArgumentList $Directory, $delay | Out-Null
+}
+
 function Start-ChallengeIde {
     param([string]$IdeCmd)
 
@@ -322,6 +428,8 @@ function Start-ChallengeIde {
     Write-Host "Launching $Ide..."
 
     Start-Process -FilePath $IdeCmd -ArgumentList @('-n', $workspaceFile)
+    Start-MaximizeIdeWindow -TargetIde $Ide
+    Schedule-WorkspaceMetadataCleanup -Directory $WorkDir
 
     Write-Host ''
     Write-Host "Done! $Ide is opening $GraftcodeUrl in the internal browser." -ForegroundColor Green
@@ -338,6 +446,8 @@ function Start-DistributedIde {
     Write-Host 'Launching Cursor...'
 
     Start-Process -FilePath $cursorCmd -ArgumentList @('-n', $WorkDir)
+    Start-MaximizeIdeWindow -TargetIde 'cursor'
+    Schedule-WorkspaceMetadataCleanup -Directory $WorkDir
 
     Write-Host ''
     Write-Host 'Done! Cursor opened in the distributed system folder.' -ForegroundColor Green
@@ -355,6 +465,7 @@ function Invoke-Challenge {
     Clear-Docker
     Clear-Mcp
     Clear-BrowserCookies
+    Set-IdeUserSettings -TargetIde $Ide
     Copy-ChallengeTemplate
     Start-ChallengeIde -IdeCmd $ideCmd
 }
@@ -364,6 +475,7 @@ function Invoke-Distributed {
     Clear-Docker
     Clear-Mcp
     Clear-BrowserCookies
+    Set-IdeUserSettings -TargetIde 'cursor'
     Set-DistributedWorkspace
     Start-DistributedIde
 }

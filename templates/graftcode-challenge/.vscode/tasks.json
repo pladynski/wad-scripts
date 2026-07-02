@@ -4,7 +4,7 @@
     {
       "label": "Open Graftcode",
       "type": "shell",
-      "command": "echo ${input:graftcodeBrowser} >/dev/null || true",
+      "command": "echo ${input:graftcodeBrowser}",
       "problemMatcher": [],
       "presentation": {
         "reveal": "never",

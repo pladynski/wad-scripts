@@ -6,6 +6,8 @@ CHALLENGE_TEMPLATE="${SCRIPT_DIR}/templates/graftcode-challenge"
 
 GRAFTCODE_URL="https://wad.graftcode.com"
 WAD_KNOWLEDGE_REPO="https://github.com/pladynski/wad-knowledge"
+WORKSPACE_METADATA_CLEANUP_DELAY=10
+CURSOR_CHAT_MAX_WIDTH=400
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -223,6 +225,145 @@ cleanup_mcp() {
   echo -e "${GREEN}MCP configuration cleared in Cursor and Visual Studio Code.${NC}"
 }
 
+configure_ide_settings() {
+  local ide="$1"
+  local settings_file
+
+  case "$ide" in
+    cursor)
+      settings_file="${HOME}/Library/Application Support/Cursor/User/settings.json"
+      ;;
+    vscode)
+      settings_file="${HOME}/Library/Application Support/Code/User/settings.json"
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  echo
+  echo -e "${BOLD}Configuring ${ide} window settings...${NC}"
+
+  mkdir -p "$(dirname "$settings_file")"
+
+  SETTINGS_FILE="$settings_file" CHAT_MAX_WIDTH="$CURSOR_CHAT_MAX_WIDTH" IDE="$ide" python3 <<'PY'
+import json
+import os
+import re
+
+path = os.environ["SETTINGS_FILE"]
+ide = os.environ["IDE"]
+
+
+def load_settings(text):
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
+    text = text.strip()
+    if not text:
+        return {}
+    return json.loads(text)
+
+
+data = {}
+if os.path.isfile(path):
+    with open(path, encoding="utf-8") as f:
+        data = load_settings(f.read())
+
+data["window.newWindowDimensions"] = "fullscreen"
+if ide == "cursor":
+    data["cursor.chatMaxWidth"] = int(os.environ["CHAT_MAX_WIDTH"])
+
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=4)
+    f.write("\n")
+PY
+
+  echo -e "${GREEN}Set window.newWindowDimensions to fullscreen in ${ide} settings.${NC}"
+  if [[ "$ide" == "cursor" ]]; then
+    echo -e "${GREEN}Set cursor.chatMaxWidth to ${CURSOR_CHAT_MAX_WIDTH} in Cursor settings.${NC}"
+  fi
+}
+
+fullscreen_ide_window() {
+  local ide="$1"
+  local app_name process_name
+
+  case "$ide" in
+    cursor)
+      app_name="Cursor"
+      process_name="Cursor"
+      ;;
+    vscode)
+      app_name="Visual Studio Code"
+      process_name="Code"
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  (
+    sleep 2
+    osascript - "$app_name" "$process_name" <<'APPLESCRIPT'
+on run argv
+  set appName to item 1 of argv
+  set processName to item 2 of argv
+
+  tell application appName to activate
+
+  set ready to false
+  repeat with i from 1 to 60
+    tell application "System Events"
+      if exists process processName then
+        repeat with w in windows of process processName
+          set {_, wH} to size of w
+          if wH > 200 then
+            set ready to true
+            exit repeat
+          end if
+        end repeat
+      end if
+    end tell
+    if ready then exit repeat
+    delay 0.25
+  end repeat
+
+  tell application "Finder"
+    set {x1, y1, x2, y2} to bounds of window of desktop
+  end tell
+  set screenH to y2 - y1
+
+  tell application "System Events"
+    tell process processName
+      if (count of windows) is 0 then return
+      set frontmost to true
+
+      set mainWindow to missing value
+      set maxArea to 0
+      repeat with w in windows
+        set {wW, wH} to size of w
+        set area to wW * wH
+        if area > maxArea then
+          set maxArea to area
+          set mainWindow to w
+        end if
+      end repeat
+
+      if mainWindow is missing value then return
+
+      set {_, windowH} to size of mainWindow
+      if windowH < screenH - 80 then
+        set value of attribute "AXMain" of mainWindow to true
+        delay 0.2
+        keystroke "f" using {control down, command down}
+      end if
+    end tell
+  end tell
+end run
+APPLESCRIPT
+  ) &
+}
+
 quit_ide_if_running() {
   local app_name="$1"
 
@@ -273,6 +414,15 @@ cleanup_browser_cookies() {
   fi
 }
 
+schedule_workspace_metadata_cleanup() {
+  local work_dir="$1"
+
+  (
+    sleep "$WORKSPACE_METADATA_CLEANUP_DELAY"
+    rm -rf "${work_dir}/.vscode"
+  ) &
+}
+
 launch_challenge() {
   local ide_cmd="$1"
   local workspace_file="${WORK_DIR}/graftcode.code-workspace"
@@ -281,6 +431,8 @@ launch_challenge() {
   echo -e "${BOLD}Launching ${IDE}...${NC}"
 
   "$ide_cmd" -n "$workspace_file" &
+  fullscreen_ide_window "$IDE"
+  schedule_workspace_metadata_cleanup "$WORK_DIR"
 
   echo
   echo -e "${GREEN}Done!${NC} ${IDE} is opening ${GRAFTCODE_URL} in the internal browser."
@@ -298,6 +450,8 @@ launch_distributed() {
   echo -e "${BOLD}Launching Cursor...${NC}"
 
   "$cursor_cmd" -n "$WORK_DIR" &
+  fullscreen_ide_window "cursor"
+  schedule_workspace_metadata_cleanup "$WORK_DIR"
 
   echo
   echo -e "${GREEN}Done!${NC} Cursor opened in the distributed system folder."
@@ -316,6 +470,7 @@ run_challenge() {
   cleanup_docker
   cleanup_mcp
   cleanup_browser_cookies
+  configure_ide_settings "$IDE"
   copy_challenge_template
   launch_challenge "$ide_cmd"
 }
@@ -325,6 +480,7 @@ run_distributed() {
   cleanup_docker
   cleanup_mcp
   cleanup_browser_cookies
+  configure_ide_settings "cursor"
   setup_distributed_workspace
   launch_distributed
 }
