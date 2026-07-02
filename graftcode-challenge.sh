@@ -305,28 +305,26 @@ cur = conn.cursor()
 
 
 def upsert(key, value):
-    cur.execute(
-        "INSERT INTO ItemTable (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (key, value),
-    )
+    cur.execute("INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)", (key, value))
 
 
 upsert("workbench.auxiliaryBar.size", str(width))
 
-cur.execute("SELECT value FROM ItemTable WHERE key = ?", ("agentLayout.shared.v6",))
-row = cur.fetchone()
-if row:
+updated_layout_keys = set()
+cur.execute("SELECT key, value FROM ItemTable WHERE key LIKE 'agentLayout.shared.%'")
+for key, value in cur.fetchall():
     try:
-        layout = json.loads(row[0])
+        layout = json.loads(value)
     except json.JSONDecodeError:
-        layout = {}
+        continue
     if not isinstance(layout, dict):
-        layout = {}
+        continue
     layout["auxiliaryBarWidth"] = width
     layout["auxiliaryBarVisible"] = True
-    upsert("agentLayout.shared.v6", json.dumps(layout, separators=(",", ":")))
-else:
+    upsert(key, json.dumps(layout, separators=(",", ":")))
+    updated_layout_keys.add(key)
+
+if not updated_layout_keys:
     layout = {
         "auxiliaryBarVisible": True,
         "auxiliaryBarWidth": width,
@@ -336,6 +334,20 @@ else:
         "statusBarVisible": True,
     }
     upsert("agentLayout.shared.v6", json.dumps(layout, separators=(",", ":")))
+
+cur.execute("SELECT key, value FROM ItemTable WHERE value LIKE '%auxiliaryBarWidth%'")
+for key, value in cur.fetchall():
+    if key in updated_layout_keys or key == "workbench.auxiliaryBar.size":
+        continue
+    try:
+        data = json.loads(value)
+    except json.JSONDecodeError:
+        continue
+    if isinstance(data, dict) and "auxiliaryBarWidth" in data:
+        data["auxiliaryBarWidth"] = width
+        if "auxiliaryBarVisible" in data:
+            data["auxiliaryBarVisible"] = True
+        upsert(key, json.dumps(data, separators=(",", ":")))
 
 conn.commit()
 conn.close()

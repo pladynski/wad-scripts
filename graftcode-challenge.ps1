@@ -158,6 +158,7 @@ function Update-JsonSettingsFile {
         $env:SETTINGS_FILE = $Path
         $env:SCOPE = $Scope
         $env:WINDOW_DIMENSIONS = $WindowDimensions
+        $env:CHAT_PANEL_WIDTH = [string]$CursorChatPanelWidth
 
         $pyScript = @'
 import json
@@ -188,8 +189,8 @@ if scope == "workspace":
 if scope != "workspace":
     data["window.newWindowDimensions"] = os.environ["WINDOW_DIMENSIONS"]
 
-if scope == "cursor":
-    data.pop("cursor.chatMaxWidth", None)
+if scope in ("cursor", "workspace"):
+    data["cursor.chatMaxWidth"] = int(os.environ["CHAT_PANEL_WIDTH"])
 
 with open(path, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=4)
@@ -205,7 +206,7 @@ with open(path, "w", encoding="utf-8") as f:
             }
         }
         finally {
-            Remove-Item Env:SETTINGS_FILE, Env:SCOPE, Env:WINDOW_DIMENSIONS -ErrorAction SilentlyContinue
+            Remove-Item Env:SETTINGS_FILE, Env:SCOPE, Env:WINDOW_DIMENSIONS, Env:CHAT_PANEL_WIDTH -ErrorAction SilentlyContinue
             if (Test-Path $pyFile) {
                 Remove-Item -LiteralPath $pyFile -Force -ErrorAction SilentlyContinue
             }
@@ -224,6 +225,10 @@ with open(path, "w", encoding="utf-8") as f:
 
     if ($Scope -ne 'workspace') {
         $content = Set-JsonSettingValue -Content $content -Key 'window.newWindowDimensions' -Value $WindowDimensions
+    }
+
+    if ($Scope -in @('cursor', 'workspace')) {
+        $content = Set-JsonSettingValue -Content $content -Key 'cursor.chatMaxWidth' -Value ([string]$CursorChatPanelWidth) -IsNumber
     }
 
     Write-Utf8TextFile -Path $Path -Content ($content.TrimEnd() + [Environment]::NewLine)
@@ -256,26 +261,8 @@ function Set-JsonSettingValue {
     return [regex]::Replace($Content, '\}\s*$', ",`r`n$entry`r`n}")
 }
 
-function Set-CursorChatPanelWidth {
-    $stateDb = Join-Path $env:APPDATA 'Cursor\User\globalStorage\state.vscdb'
-    if (-not (Test-Path $stateDb)) {
-        Write-Host 'Cursor state database not found — skipping chat panel width.' -ForegroundColor Yellow
-        return
-    }
-
-    Write-Host ''
-    Write-Host 'Configuring Cursor chat panel width...'
-
-    $python = Get-PythonLauncher
-    if (-not $python) {
-        Write-Host 'Python not found — cannot set Cursor chat panel width.' -ForegroundColor Yellow
-        return
-    }
-
-    $env:STATE_DB = $stateDb
-    $env:PANEL_WIDTH = [string]$CursorChatPanelWidth
-
-    $pyScript = @'
+function Get-CursorStatePythonScript {
+    return @'
 import json
 import os
 import sqlite3
@@ -288,28 +275,26 @@ cur = conn.cursor()
 
 
 def upsert(key, value):
-    cur.execute(
-        "INSERT INTO ItemTable (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (key, value),
-    )
+    cur.execute("INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)", (key, value))
 
 
 upsert("workbench.auxiliaryBar.size", str(width))
 
-cur.execute("SELECT value FROM ItemTable WHERE key = ?", ("agentLayout.shared.v6",))
-row = cur.fetchone()
-if row:
+updated_layout_keys = set()
+cur.execute("SELECT key, value FROM ItemTable WHERE key LIKE 'agentLayout.shared.%'")
+for key, value in cur.fetchall():
     try:
-        layout = json.loads(row[0])
+        layout = json.loads(value)
     except json.JSONDecodeError:
-        layout = {}
+        continue
     if not isinstance(layout, dict):
-        layout = {}
+        continue
     layout["auxiliaryBarWidth"] = width
     layout["auxiliaryBarVisible"] = True
-    upsert("agentLayout.shared.v6", json.dumps(layout, separators=(",", ":")))
-else:
+    upsert(key, json.dumps(layout, separators=(",", ":")))
+    updated_layout_keys.add(key)
+
+if not updated_layout_keys:
     layout = {
         "auxiliaryBarVisible": True,
         "auxiliaryBarWidth": width,
@@ -320,26 +305,352 @@ else:
     }
     upsert("agentLayout.shared.v6", json.dumps(layout, separators=(",", ":")))
 
+cur.execute("SELECT key, value FROM ItemTable WHERE value LIKE '%auxiliaryBarWidth%'")
+for key, value in cur.fetchall():
+    if key in updated_layout_keys or key == "workbench.auxiliaryBar.size":
+        continue
+    try:
+        data = json.loads(value)
+    except json.JSONDecodeError:
+        continue
+    if isinstance(data, dict) and "auxiliaryBarWidth" in data:
+        data["auxiliaryBarWidth"] = width
+        if "auxiliaryBarVisible" in data:
+            data["auxiliaryBarVisible"] = True
+        upsert(key, json.dumps(data, separators=(",", ":")))
+
 conn.commit()
 conn.close()
 '@
+}
 
-    $pyFile = [System.IO.Path]::GetTempFileName() + '.py'
-    try {
-        Write-Utf8TextFile -Path $pyFile -Content $pyScript
-        & $python.Command @($python.PrefixArgs + $pyFile) | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            throw "Python state update failed with exit code $LASTEXITCODE"
-        }
-    }
-    finally {
-        Remove-Item Env:STATE_DB, Env:PANEL_WIDTH -ErrorAction SilentlyContinue
-        if (Test-Path $pyFile) {
-            Remove-Item -LiteralPath $pyFile -Force -ErrorAction SilentlyContinue
-        }
+function Get-Sqlite3Command {
+    $paths = @(
+        (Join-Path ${env:ProgramFiles} 'Git\usr\bin\sqlite3.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Git\usr\bin\sqlite3.exe')
+    )
+
+    foreach ($path in $paths) {
+        if (Test-Path $path) { return $path }
     }
 
-    Write-Host "Set Cursor chat panel width to $CursorChatPanelWidth px." -ForegroundColor Green
+    return $null
+}
+
+function Invoke-CursorStateDatabaseUpdate {
+    param(
+        [string]$StateDbPath,
+        [int]$Width
+    )
+
+    if (-not $StateDbPath -or -not (Test-Path (Split-Path $StateDbPath -Parent))) {
+        return $false
+    }
+
+    if (-not (Test-Path $StateDbPath)) {
+        $sqlite3 = Get-Sqlite3Command
+        if ($sqlite3) {
+            & $sqlite3 $StateDbPath "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);" | Out-Null
+        }
+    }
+
+    if (-not (Test-Path $StateDbPath)) {
+        return $false
+    }
+
+    $python = Get-PythonLauncher
+    if ($python) {
+        $env:STATE_DB = $StateDbPath
+        $env:PANEL_WIDTH = [string]$Width
+        $pyFile = [System.IO.Path]::GetTempFileName() + '.py'
+
+        try {
+            Write-Utf8TextFile -Path $pyFile -Content (Get-CursorStatePythonScript)
+            $output = & $python.Command @($python.PrefixArgs + $pyFile) 2>&1
+            if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+                throw "Python state update failed: $output"
+            }
+            return $true
+        }
+        finally {
+            Remove-Item Env:STATE_DB, Env:PANEL_WIDTH -ErrorAction SilentlyContinue
+            if (Test-Path $pyFile) {
+                Remove-Item -LiteralPath $pyFile -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    $sqlite3 = Get-Sqlite3Command
+    if ($sqlite3) {
+        & $sqlite3 $StateDbPath "INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('workbench.auxiliaryBar.size', '$Width');" | Out-Null
+        return $true
+    }
+
+    return $false
+}
+
+function Get-CursorWorkspaceStorageCandidates {
+    param([string]$WorkDirectory)
+
+    $fullPath = [System.IO.Path]::GetFullPath($WorkDirectory)
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $md5 = [System.Security.Cryptography.MD5]::Create()
+
+    $pathVariants = @(
+        $fullPath,
+        $fullPath.ToLowerInvariant(),
+        ([Uri]$fullPath).AbsoluteUri,
+        ([Uri]$fullPath).AbsoluteUri.ToLowerInvariant()
+    )
+
+    foreach ($pathVariant in ($pathVariants | Select-Object -Unique)) {
+        $hash = -join ($md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($pathVariant)) | ForEach-Object { $_.ToString('x2') })
+        $candidates.Add($hash)
+    }
+
+    return $candidates | Select-Object -Unique
+}
+
+function Initialize-CursorWorkspaceStorage {
+    param(
+        [string]$WorkDirectory,
+        [int]$Width
+    )
+
+    $storageRoot = Join-Path $env:APPDATA 'Cursor\User\workspaceStorage'
+    if (-not (Test-Path $storageRoot)) {
+        New-Item -ItemType Directory -Path $storageRoot -Force | Out-Null
+    }
+
+    $fullPath = [System.IO.Path]::GetFullPath($WorkDirectory)
+    $folderUri = ([Uri]$fullPath).AbsoluteUri
+    $workspaceJson = (@{ folder = $folderUri } | ConvertTo-Json -Compress)
+
+    foreach ($storageId in Get-CursorWorkspaceStorageCandidates -WorkDirectory $WorkDirectory) {
+        $workspaceFolder = Join-Path $storageRoot $storageId
+        if (-not (Test-Path $workspaceFolder)) {
+            New-Item -ItemType Directory -Path $workspaceFolder -Force | Out-Null
+        }
+
+        Write-Utf8TextFile -Path (Join-Path $workspaceFolder 'workspace.json') -Content ($workspaceJson + [Environment]::NewLine)
+
+        $stateDb = Join-Path $workspaceFolder 'state.vscdb'
+        if (-not (Test-Path $stateDb)) {
+            $sqlite3 = Get-Sqlite3Command
+            if ($sqlite3) {
+                & $sqlite3 $stateDb "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);" | Out-Null
+            }
+            else {
+                $python = Get-PythonLauncher
+                if ($python) {
+                    $env:STATE_DB = $stateDb
+                    $initFile = [System.IO.Path]::GetTempFileName() + '.py'
+                    try {
+                        Write-Utf8TextFile -Path $initFile -Content @'
+import os, sqlite3
+conn = sqlite3.connect(os.environ["STATE_DB"])
+conn.execute("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)")
+conn.commit()
+conn.close()
+'@
+                        & $python.Command @($python.PrefixArgs + $initFile) | Out-Null
+                    }
+                    finally {
+                        Remove-Item Env:STATE_DB -ErrorAction SilentlyContinue
+                        if (Test-Path $initFile) {
+                            Remove-Item -LiteralPath $initFile -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+                }
+            }
+        }
+
+        if (Test-Path $stateDb) {
+            Invoke-CursorStateDatabaseUpdate -StateDbPath $stateDb -Width $Width | Out-Null
+        }
+    }
+}
+
+function Find-CursorWorkspaceStateDatabases {
+    param([string]$WorkDirectory)
+
+    $stateDbs = New-Object System.Collections.Generic.List[string]
+    $storageRoot = Join-Path $env:APPDATA 'Cursor\User\workspaceStorage'
+    $fullPath = [System.IO.Path]::GetFullPath($WorkDirectory)
+
+    foreach ($storageId in Get-CursorWorkspaceStorageCandidates -WorkDirectory $WorkDirectory) {
+        $stateDb = Join-Path $storageRoot "$storageId\state.vscdb"
+        if (Test-Path $stateDb) {
+            $stateDbs.Add($stateDb)
+        }
+    }
+
+    if (-not (Test-Path $storageRoot)) {
+        return $stateDbs
+    }
+
+    foreach ($entry in Get-ChildItem -Path $storageRoot -Directory -ErrorAction SilentlyContinue) {
+        $workspaceJson = Join-Path $entry.FullName 'workspace.json'
+        $stateDb = Join-Path $entry.FullName 'state.vscdb'
+        if (-not (Test-Path $workspaceJson) -or -not (Test-Path $stateDb)) { continue }
+
+        $text = [System.IO.File]::ReadAllText($workspaceJson)
+        if ($text -like "*$fullPath*" -or $text -like "*$($fullPath.Replace('\', '/'))*") {
+            if (-not $stateDbs.Contains($stateDb)) {
+                $stateDbs.Add($stateDb)
+            }
+        }
+    }
+
+    return $stateDbs
+}
+
+function Update-CursorChatPanelState {
+    param(
+        [string]$WorkDirectory,
+        [int]$Width
+    )
+
+    $updated = $false
+    $globalStateDb = Join-Path $env:APPDATA 'Cursor\User\globalStorage\state.vscdb'
+    if (Invoke-CursorStateDatabaseUpdate -StateDbPath $globalStateDb -Width $Width) {
+        $updated = $true
+    }
+
+    if ($WorkDirectory) {
+        Initialize-CursorWorkspaceStorage -WorkDirectory $WorkDirectory -Width $Width | Out-Null
+        foreach ($stateDb in Find-CursorWorkspaceStateDatabases -WorkDirectory $WorkDirectory) {
+            if (Invoke-CursorStateDatabaseUpdate -StateDbPath $stateDb -Width $Width) {
+                $updated = $true
+            }
+        }
+    }
+
+    return $updated
+}
+
+function Set-CursorChatPanelWidth {
+    param([string]$WorkDirectory)
+
+    Write-Host ''
+    Write-Host 'Configuring Cursor chat panel width...'
+
+    if (-not (Update-CursorChatPanelState -WorkDirectory $WorkDirectory -Width $CursorChatPanelWidth)) {
+        Write-Host 'Could not update Cursor layout database. Install Python or Git for Windows (sqlite3).' -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "Set Cursor chat panel width to $CursorChatPanelWidth px." -ForegroundColor Green
+    }
+}
+
+function Schedule-CursorChatPanelWidth {
+    param(
+        [string]$WorkDirectory,
+        [int]$Width = $CursorChatPanelWidth
+    )
+
+    Start-Job -ScriptBlock {
+        param($Directory, $PanelWidth)
+
+        function Get-PythonLauncherLocal {
+            if (Get-Command py -ErrorAction SilentlyContinue) { return @{ Command = 'py'; PrefixArgs = @('-3') } }
+            if (Get-Command python -ErrorAction SilentlyContinue) { return @{ Command = 'python'; PrefixArgs = @() } }
+            if (Get-Command python3 -ErrorAction SilentlyContinue) { return @{ Command = 'python3'; PrefixArgs = @() } }
+            return $null
+        }
+
+        foreach ($delay in @(4, 10, 18)) {
+            Start-Sleep -Seconds $delay
+
+            $globalDb = Join-Path $env:APPDATA 'Cursor\User\globalStorage\state.vscdb'
+            if (Test-Path $globalDb) {
+                $env:STATE_DB = $globalDb
+                $env:PANEL_WIDTH = [string]$PanelWidth
+                $python = Get-PythonLauncherLocal
+                if ($python) {
+                    $pyFile = [System.IO.Path]::GetTempFileName() + '.py'
+                    try {
+                        $script = @'
+import json, os, sqlite3
+db_path = os.environ["STATE_DB"]
+width = int(os.environ["PANEL_WIDTH"])
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+def upsert(key, value):
+    cur.execute("INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)", (key, value))
+upsert("workbench.auxiliaryBar.size", str(width))
+cur.execute("SELECT key, value FROM ItemTable WHERE key LIKE 'agentLayout.shared.%'")
+for key, value in cur.fetchall():
+    try:
+        layout = json.loads(value)
+    except json.JSONDecodeError:
+        continue
+    if isinstance(layout, dict):
+        layout["auxiliaryBarWidth"] = width
+        layout["auxiliaryBarVisible"] = True
+        upsert(key, json.dumps(layout, separators=(",", ":")))
+conn.commit()
+conn.close()
+'@
+                        [System.IO.File]::WriteAllText($pyFile, $script, [System.Text.UTF8Encoding]::new($false))
+                        & $python.Command @($python.PrefixArgs + $pyFile) | Out-Null
+                    }
+                    finally {
+                        Remove-Item Env:STATE_DB, Env:PANEL_WIDTH -ErrorAction SilentlyContinue
+                        if (Test-Path $pyFile) { Remove-Item -LiteralPath $pyFile -Force -ErrorAction SilentlyContinue }
+                    }
+                }
+            }
+
+            $storageRoot = Join-Path $env:APPDATA 'Cursor\User\workspaceStorage'
+            if ((Test-Path $storageRoot) -and $Directory) {
+                foreach ($entry in Get-ChildItem -Path $storageRoot -Directory -ErrorAction SilentlyContinue) {
+                    $workspaceJson = Join-Path $entry.FullName 'workspace.json'
+                    $stateDb = Join-Path $entry.FullName 'state.vscdb'
+                    if (-not (Test-Path $workspaceJson) -or -not (Test-Path $stateDb)) { continue }
+                    $text = [System.IO.File]::ReadAllText($workspaceJson)
+                    if ($text -notlike "*$Directory*") { continue }
+
+                    $env:STATE_DB = $stateDb
+                    $env:PANEL_WIDTH = [string]$PanelWidth
+                    $python = Get-PythonLauncherLocal
+                    if ($python) {
+                        $pyFile = [System.IO.Path]::GetTempFileName() + '.py'
+                        try {
+                            $script = @'
+import json, os, sqlite3
+db_path = os.environ["STATE_DB"]
+width = int(os.environ["PANEL_WIDTH"])
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+def upsert(key, value):
+    cur.execute("INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)", (key, value))
+upsert("workbench.auxiliaryBar.size", str(width))
+cur.execute("SELECT key, value FROM ItemTable WHERE key LIKE 'agentLayout.shared.%'")
+for key, value in cur.fetchall():
+    try:
+        layout = json.loads(value)
+    except json.JSONDecodeError:
+        continue
+    if isinstance(layout, dict):
+        layout["auxiliaryBarWidth"] = width
+        layout["auxiliaryBarVisible"] = True
+        upsert(key, json.dumps(layout, separators=(",", ":")))
+conn.commit()
+conn.close()
+'@
+                            [System.IO.File]::WriteAllText($pyFile, $script, [System.Text.UTF8Encoding]::new($false))
+                            & $python.Command @($python.PrefixArgs + $pyFile) | Out-Null
+                        }
+                        finally {
+                            Remove-Item Env:STATE_DB, Env:PANEL_WIDTH -ErrorAction SilentlyContinue
+                            if (Test-Path $pyFile) { Remove-Item -LiteralPath $pyFile -Force -ErrorAction SilentlyContinue }
+                        }
+                    }
+                }
+            }
+        }
+    } -ArgumentList $WorkDirectory, $Width | Out-Null
 }
 
 function Set-DistributedWorkspace {
@@ -517,6 +828,9 @@ function Set-IdeUserSettings {
     Update-JsonSettingsFile -Path $settingsFile -Scope $TargetIde -WindowDimensions 'maximized'
 
     Write-Host "Set window.newWindowDimensions to maximized in $TargetIde settings." -ForegroundColor Green
+    if ($TargetIde -eq 'cursor') {
+        Write-Host "Set cursor.chatMaxWidth to $CursorChatPanelWidth in Cursor settings." -ForegroundColor Green
+    }
 }
 
 function Start-MaximizeIdeWindow {
@@ -631,6 +945,9 @@ function Start-ChallengeIde {
 
     Start-Process -FilePath $IdeCmd -ArgumentList @('-n', $workspaceFile)
     Start-MaximizeIdeWindow -TargetIde $Ide
+    if ($Ide -eq 'cursor') {
+        Schedule-CursorChatPanelWidth -WorkDirectory $WorkDir
+    }
     Schedule-WorkspaceMetadataCleanup -Directory $WorkDir
 
     Write-Host ''
@@ -649,6 +966,7 @@ function Start-DistributedIde {
 
     Start-Process -FilePath $cursorCmd -ArgumentList @('-n', $WorkDir)
     Start-MaximizeIdeWindow -TargetIde 'cursor'
+    Schedule-CursorChatPanelWidth -WorkDirectory $WorkDir
     Schedule-WorkspaceMetadataCleanup -Directory $WorkDir
 
     Write-Host ''
@@ -669,7 +987,7 @@ function Invoke-Challenge {
     Clear-BrowserCookies
     Set-IdeUserSettings -TargetIde $Ide
     if ($Ide -eq 'cursor') {
-        Set-CursorChatPanelWidth
+        Set-CursorChatPanelWidth -WorkDirectory $WorkDir
     }
     Copy-ChallengeTemplate
     Start-ChallengeIde -IdeCmd $ideCmd
@@ -681,7 +999,7 @@ function Invoke-Distributed {
     Clear-Mcp
     Clear-BrowserCookies
     Set-IdeUserSettings -TargetIde 'cursor'
-    Set-CursorChatPanelWidth
+    Set-CursorChatPanelWidth -WorkDirectory $WorkDir
     Set-DistributedWorkspace
     Start-DistributedIde
 }
