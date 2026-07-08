@@ -6,6 +6,8 @@
     }
   ],
   "settings": {
-    "task.allowAutomaticTasks": "on"
+    "task.allowAutomaticTasks": "on",
+    "workbench.editor.restoreViewState": false,
+    "files.hotExit": "off"
   }
 }

@@ -7,6 +7,17 @@ $GraftcodeUrl = 'https://wad.graftcode.com'
 $WadKnowledgeRepo = 'https://github.com/pladynski/wad-knowledge'
 $WorkspaceMetadataCleanupDelay = 10
 $CursorChatPanelWidth = 400
+$MainStageRoot = 'C:\dev'
+$MainStageProjects = @(
+    (Join-Path $MainStageRoot 'wad-knowledge'),
+    (Join-Path $MainStageRoot 'wad-speckit'),
+    (Join-Path $MainStageRoot 'wad-graft-demo'),
+    (Join-Path $MainStageRoot 'wad-rest-demo')
+)
+$MainStageDockerComposeProjects = @(
+    (Join-Path $MainStageRoot 'wad-graft-demo'),
+    (Join-Path $MainStageRoot 'wad-rest-demo')
+)
 
 $Mode = ''
 $Ide = ''
@@ -16,16 +27,16 @@ function Show-Banner {
     Clear-Host
     Write-Host @'
    ____ ____      _    _____ _____ ____ ___  ____  _____
-  / ___|  _ \    / \  |_   _| ____/ ___|  _ \|  _ \| ____|
- | |  _| |_) |  / _ \   | | |  _|| |   | | | | | | |  _|
- | |_| |  _ <  / ___ \  | | | |__| |___| |_| | |_| | |___|
-  \____|_| \_\/_/   \_\ |_| |_____\____|____/|____/|_____|
+  / ___|  _ \    / \  |  ___|_   _/ ___/ _ \|  _ \| ____|
+ | |  _| |_) |  / _ \ | |_    | || |  | | | | | | |  _|
+ | |_| |  _ <  / ___ \|  _|   | || |__| |_| | |_| | |___
+  \____|_| \_\/_/   \_\_|     |_| \____\___/|____/|_____|
 
-   ____ _   _    _    _       _     _____ _   _ _____ ____  _____
-  / ___| | | |  / \  | |     | |   | ____| \ | |_   _|  _ \| ____|
- | |   | |_| | / _ \ | |     | |   |  _| |  \| | | | | |_) |  _|
- | |___|  _  |/ ___ \| |___  | |___| |___| |\  | | | |  _ <| |___|
-  \____|_| |_/_/   \_\_____| |_____|_____|_| \_| |_| |_| \_\_____|
+   ____ _   _    _    _     _     _____ _   _  ____ _____
+  / ___| | | |  / \  | |   | |   | ____| \ | |/ ___| ____|
+ | |   | |_| | / _ \ | |   | |   |  _| |  \| | |  _|  _|
+ | |___|  _  |/ ___ \| |___| |___| |___| |\  | |_| | |___
+  \____|_| |_/_/   \_\_____|_____|_____|_| \_|\____|_____|
 '@ -ForegroundColor Cyan
     Write-Host 'Welcome to the world of Graftcode!' -ForegroundColor Yellow
     Write-Host ''
@@ -35,14 +46,16 @@ function Choose-Mode {
     Write-Host 'What would you like to do?'
     Write-Host '  1) Graftcode Challenge'
     Write-Host '  2) Build a distributed system using Graftcode'
+    Write-Host '  3) Main Stage Session'
     Write-Host ''
 
     while ($true) {
-        $choice = Read-Host 'Your choice [1/2]'
+        $choice = Read-Host 'Your choice [1/2/3]'
         switch ($choice) {
             '1' { $script:Mode = 'challenge'; return }
             '2' { $script:Mode = 'distributed'; return }
-            default { Write-Host 'Invalid choice. Enter 1 or 2.' -ForegroundColor Red }
+            '3' { $script:Mode = 'mainstage'; return }
+            default { Write-Host 'Invalid choice. Enter 1, 2, or 3.' -ForegroundColor Red }
         }
     }
 }
@@ -96,9 +109,35 @@ function Find-IdeCmd {
     return $null
 }
 
-function New-WorkspaceDir {
-    $folderName = [guid]::NewGuid().ToString()
-    $script:WorkDir = Join-Path $env:USERPROFILE "dev\$folderName"
+function Stop-BuildProcesses {
+    Write-Host ''
+    Write-Host 'Stopping esbuild and node processes...'
+
+    $stopped = $false
+    foreach ($name in @('esbuild', 'node')) {
+        $processes = Get-Process -Name $name -ErrorAction SilentlyContinue
+        if (-not $processes) { continue }
+
+        Write-Host "Stopping $name processes..." -ForegroundColor Yellow
+        $processes | Stop-Process -Force -ErrorAction SilentlyContinue
+        $stopped = $true
+    }
+
+    if ($stopped) {
+        Start-Sleep -Seconds 1
+        Write-Host 'Stopped esbuild and node processes.' -ForegroundColor Green
+    }
+    else {
+        Write-Host 'No esbuild or node processes running — skipping.' -ForegroundColor Yellow
+    }
+}
+
+function Reset-WorkspaceDir {
+    $script:WorkDir = Join-Path $env:USERPROFILE 'dev\graftcode_challenge'
+    if (Test-Path $WorkDir) {
+        Remove-Item -Path $WorkDir -Recurse -Force
+        Write-Host "Cleaned existing folder: $WorkDir" -ForegroundColor Yellow
+    }
     New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
     Write-Host "Created folder: $WorkDir" -ForegroundColor Green
 }
@@ -185,6 +224,8 @@ if os.path.isfile(path):
 
 if scope == "workspace":
     data["task.allowAutomaticTasks"] = "on"
+    data["workbench.editor.restoreViewState"] = False
+    data["files.hotExit"] = "off"
 
 if scope != "workspace":
     data["window.newWindowDimensions"] = os.environ["WINDOW_DIMENSIONS"]
@@ -221,6 +262,8 @@ with open(path, "w", encoding="utf-8") as f:
 
     if ($Scope -eq 'workspace') {
         $content = Set-JsonSettingValue -Content $content -Key 'task.allowAutomaticTasks' -Value 'on'
+        $content = Set-JsonSettingValue -Content $content -Key 'workbench.editor.restoreViewState' -Value 'false' -IsBoolean
+        $content = Set-JsonSettingValue -Content $content -Key 'files.hotExit' -Value 'off'
     }
 
     if ($Scope -ne 'workspace') {
@@ -239,14 +282,23 @@ function Set-JsonSettingValue {
         [string]$Content,
         [string]$Key,
         [string]$Value,
-        [switch]$IsNumber
+        [switch]$IsNumber,
+        [switch]$IsBoolean
     )
 
     $escapedKey = [regex]::Escape($Key)
-    $replacement = if ($IsNumber) { "`"$Key`": $Value" } else { "`"$Key`": `"$Value`"" }
+    $replacement = if ($IsBoolean) {
+        "`"$Key`": $Value"
+    }
+    elseif ($IsNumber) {
+        "`"$Key`": $Value"
+    }
+    else {
+        "`"$Key`": `"$Value`""
+    }
 
     if ($Content -match "`"$escapedKey`"\s*:") {
-        if ($IsNumber) {
+        if ($IsNumber -or $IsBoolean) {
             return [regex]::Replace($Content, "`"$escapedKey`"\s*:\s*[^,\r\n\}]+", $replacement)
         }
 
@@ -741,7 +793,7 @@ function Set-DistributedWorkspace {
 
 function Clear-Docker {
     Write-Host ''
-    Write-Host 'Cleaning up running Docker containers...'
+    Write-Host 'Cleaning up Docker containers and networks...'
 
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
         Write-Host 'Docker is not installed — skipping.' -ForegroundColor Yellow
@@ -754,14 +806,24 @@ function Clear-Docker {
         return
     }
 
-    $running = docker ps -q 2>$null
-    if (-not $running) {
-        Write-Host 'No running containers.' -ForegroundColor Yellow
-        return
+    $containers = docker ps -aq 2>$null
+    if ($containers) {
+        docker rm -f $containers
+        Write-Host 'Removed Docker containers.' -ForegroundColor Green
+    }
+    else {
+        Write-Host 'No Docker containers.' -ForegroundColor Yellow
     }
 
-    docker rm -f $running
-    Write-Host 'Removed running Docker containers.' -ForegroundColor Green
+    $networks = docker network ls --format '{{.Name}}' 2>$null |
+        Where-Object { $_ -notin @('bridge', 'host', 'none') }
+    if ($networks) {
+        docker network rm $networks 2>$null
+        Write-Host 'Removed Docker networks.' -ForegroundColor Green
+    }
+    else {
+        Write-Host 'No custom Docker networks.' -ForegroundColor Yellow
+    }
 }
 
 function Reset-McpFile {
@@ -891,6 +953,63 @@ function Stop-IdeIfRunning {
     }
 }
 
+function Clear-CursorWorkspaceSession {
+    $workDir = Join-Path $env:USERPROFILE 'dev\graftcode_challenge'
+    $workspaceFile = Join-Path $workDir 'graftcode.code-workspace'
+    $pathVariants = @(
+        [System.IO.Path]::GetFullPath($workDir),
+        [System.IO.Path]::GetFullPath($workspaceFile)
+    )
+
+    Write-Host ''
+    Write-Host 'Clearing Cursor workspace session (tabs, editors)...'
+
+    $cleared = $false
+    $storageRoot = Join-Path $env:APPDATA 'Cursor\User\workspaceStorage'
+    if (Test-Path $storageRoot) {
+        foreach ($entry in Get-ChildItem -Path $storageRoot -Directory -ErrorAction SilentlyContinue) {
+            $workspaceJson = Join-Path $entry.FullName 'workspace.json'
+            if (-not (Test-Path $workspaceJson)) { continue }
+
+            $text = [System.IO.File]::ReadAllText($workspaceJson)
+            $shouldRemove = $text -match 'graftcode_challenge'
+            if (-not $shouldRemove) {
+                foreach ($pathVariant in $pathVariants) {
+                    $normalized = $pathVariant.Replace('\', '/')
+                    if ($text -like "*$pathVariant*" -or $text -like "*$normalized*") {
+                        $shouldRemove = $true
+                        break
+                    }
+                }
+            }
+
+            if (-not $shouldRemove) { continue }
+
+            Remove-Item -LiteralPath $entry.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "Removed Cursor workspace storage: $($entry.Name)" -ForegroundColor Green
+            $cleared = $true
+        }
+    }
+
+    $projectsRoot = Join-Path $env:USERPROFILE '.cursor\projects'
+    if (Test-Path $projectsRoot) {
+        foreach ($entry in Get-ChildItem -Path $projectsRoot -Directory -ErrorAction SilentlyContinue) {
+            if ($entry.Name -notmatch 'graftcode[-_]challenge') { continue }
+
+            Remove-Item -LiteralPath $entry.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "Removed Cursor project data: $($entry.Name)" -ForegroundColor Green
+            $cleared = $true
+        }
+    }
+
+    if (-not $cleared) {
+        Write-Host 'No Cursor session data found for graftcode challenge — skipping.' -ForegroundColor Yellow
+    }
+    else {
+        Write-Host 'Cursor session cleared.' -ForegroundColor Green
+    }
+}
+
 function Clear-BrowserCookies {
     Write-Host ''
     Write-Host 'Cleaning up IDE browser cookies...'
@@ -974,6 +1093,91 @@ function Start-DistributedIde {
     Write-Host "Folder: $WorkDir" -ForegroundColor Cyan
 }
 
+function Initialize-ChallengeEnvironment {
+    param(
+        [ValidateSet('cursor', 'vscode')]
+        [string]$TargetIde = 'cursor'
+    )
+
+    Clear-Docker
+    Clear-Mcp
+    Clear-BrowserCookies
+    Clear-CursorWorkspaceSession
+    Stop-BuildProcesses
+    Reset-WorkspaceDir
+    Set-IdeUserSettings -TargetIde $TargetIde
+    if ($TargetIde -eq 'cursor') {
+        Set-CursorChatPanelWidth -WorkDirectory $WorkDir
+    }
+}
+
+function Start-DockerComposeUp {
+    param([string]$ProjectDirectory)
+
+    if (-not (Test-Path $ProjectDirectory)) {
+        Write-Error "Project folder not found: $ProjectDirectory"
+    }
+
+    $composeFile = @(
+        (Join-Path $ProjectDirectory 'docker-compose.yml'),
+        (Join-Path $ProjectDirectory 'docker-compose.yaml')
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+    if (-not $composeFile) {
+        Write-Host "No docker-compose file in $ProjectDirectory - skipping." -ForegroundColor Yellow
+        return
+    }
+
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+        Write-Host "Docker is not installed - skipping compose in $ProjectDirectory." -ForegroundColor Yellow
+        return
+    }
+
+    docker info *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Docker is not running - skipping compose in $ProjectDirectory." -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "Starting docker compose in $ProjectDirectory..."
+    Start-Process -FilePath 'cmd.exe' -ArgumentList '/k', 'docker compose up' -WorkingDirectory $ProjectDirectory
+    Write-Host "Docker compose started in $ProjectDirectory." -ForegroundColor Green
+}
+
+function Start-MainStageSession {
+    $cursorCmd = Find-IdeCmd -TargetIde 'cursor'
+    if (-not $cursorCmd) {
+        Write-Error 'Cursor not found. Install Cursor and add it to your PATH.'
+    }
+
+    foreach ($projectDir in $MainStageProjects) {
+        if (-not (Test-Path $projectDir)) {
+            Write-Error "Project folder not found: $projectDir"
+        }
+    }
+
+    Write-Host ''
+    Write-Host 'Launching Main Stage Session...'
+
+    foreach ($projectDir in $MainStageProjects) {
+        Write-Host "Opening Cursor in $projectDir"
+        Start-Process -FilePath $cursorCmd -ArgumentList @('-n', $projectDir)
+        Start-Sleep -Milliseconds 500
+    }
+
+    foreach ($projectDir in $MainStageDockerComposeProjects) {
+        Start-DockerComposeUp -ProjectDirectory $projectDir
+    }
+
+    Start-MaximizeIdeWindow -TargetIde 'cursor'
+
+    Write-Host ''
+    Write-Host 'Done! Main Stage Session is ready.' -ForegroundColor Green
+    foreach ($projectDir in $MainStageProjects) {
+        Write-Host "  $projectDir" -ForegroundColor Cyan
+    }
+}
+
 function Invoke-Challenge {
     Choose-Ide
     $ideCmd = Find-IdeCmd -TargetIde $Ide
@@ -981,27 +1185,20 @@ function Invoke-Challenge {
         Write-Error "$Ide not found. Install the IDE and add it to your PATH."
     }
 
-    New-WorkspaceDir
-    Clear-Docker
-    Clear-Mcp
-    Clear-BrowserCookies
-    Set-IdeUserSettings -TargetIde $Ide
-    if ($Ide -eq 'cursor') {
-        Set-CursorChatPanelWidth -WorkDirectory $WorkDir
-    }
+    Initialize-ChallengeEnvironment -TargetIde $Ide
     Copy-ChallengeTemplate
     Start-ChallengeIde -IdeCmd $ideCmd
 }
 
 function Invoke-Distributed {
-    New-WorkspaceDir
-    Clear-Docker
-    Clear-Mcp
-    Clear-BrowserCookies
-    Set-IdeUserSettings -TargetIde 'cursor'
-    Set-CursorChatPanelWidth -WorkDirectory $WorkDir
+    Initialize-ChallengeEnvironment -TargetIde 'cursor'
     Set-DistributedWorkspace
     Start-DistributedIde
+}
+
+function Invoke-MainStage {
+    Initialize-ChallengeEnvironment -TargetIde 'cursor'
+    Start-MainStageSession
 }
 
 Show-Banner
@@ -1010,4 +1207,5 @@ Choose-Mode
 switch ($Mode) {
     'challenge' { Invoke-Challenge }
     'distributed' { Invoke-Distributed }
+    'mainstage' { Invoke-MainStage }
 }

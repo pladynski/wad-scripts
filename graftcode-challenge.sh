@@ -9,6 +9,23 @@ WAD_KNOWLEDGE_REPO="https://github.com/pladynski/wad-knowledge"
 WORKSPACE_METADATA_CLEANUP_DELAY=10
 CURSOR_CHAT_PANEL_WIDTH=400
 
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) MAIN_STAGE_ROOT="/c/dev" ;;
+  *) MAIN_STAGE_ROOT="${HOME}/dev" ;;
+esac
+
+MAIN_STAGE_PROJECTS=(
+  "${MAIN_STAGE_ROOT}/wad-knowledge"
+  "${MAIN_STAGE_ROOT}/wad-speckit"
+  "${MAIN_STAGE_ROOT}/wad-graft-demo"
+  "${MAIN_STAGE_ROOT}/wad-rest-demo"
+)
+
+MAIN_STAGE_DOCKER_COMPOSE_PROJECTS=(
+  "${MAIN_STAGE_ROOT}/wad-graft-demo"
+  "${MAIN_STAGE_ROOT}/wad-rest-demo"
+)
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -25,16 +42,16 @@ show_banner() {
   echo -e "${CYAN}${BOLD}"
   cat <<'EOF'
    ____ ____      _    _____ _____ ____ ___  ____  _____
-  / ___|  _ \    / \  |_   _| ____/ ___|  _ \|  _ \| ____|
- | |  _| |_) |  / _ \   | | |  _|| |   | | | | | | |  _|
- | |_| |  _ <  / ___ \  | | | |__| |___| |_| | |_| | |___
-  \____|_| \_\/_/   \_\ |_| |_____\____|____/|____/|_____|
+  / ___|  _ \    / \  |  ___|_   _/ ___/ _ \|  _ \| ____|
+ | |  _| |_) |  / _ \ | |_    | || |  | | | | | | |  _|
+ | |_| |  _ <  / ___ \|  _|   | || |__| |_| | |_| | |___
+  \____|_| \_\/_/   \_\_|     |_| \____\___/|____/|_____|
 
-   ____ _   _    _    _       _     _____ _   _ _____ ____  _____
-  / ___| | | |  / \  | |     | |   | ____| \ | |_   _|  _ \| ____|
- | |   | |_| | / _ \ | |     | |   |  _| |  \| | | | | |_) |  _|
- | |___|  _  |/ ___ \| |___  | |___| |___| |\  | | | |  _ <| |___
-  \____|_| |_/_/   \_\_____| |_____|_____|_| \_| |_| |_| \_\_____|
+   ____ _   _    _    _     _     _____ _   _  ____ _____
+  / ___| | | |  / \  | |   | |   | ____| \ | |/ ___| ____|
+ | |   | |_| | / _ \ | |   | |   |  _| |  \| | |  _|  _|
+ | |___|  _  |/ ___ \| |___| |___| |___| |\  | |_| | |___
+  \____|_| |_/_/   \_\_____|_____|_____|_| \_|\____|_____|
 EOF
   echo -e "${NC}"
   echo -e "${YELLOW}Welcome to the world of Graftcode!${NC}"
@@ -45,13 +62,15 @@ choose_mode() {
   echo -e "${BOLD}What would you like to do?${NC}"
   echo "  1) Graftcode Challenge"
   echo "  2) Build a distributed system using Graftcode"
+  echo "  3) Main Stage Session"
   echo
   while true; do
-    read -r -p "Your choice [1/2]: " choice
+    read -r -p "Your choice [1/2/3]: " choice
     case "$choice" in
       1) MODE="challenge"; return ;;
       2) MODE="distributed"; return ;;
-      *) echo -e "${RED}Invalid choice. Enter 1 or 2.${NC}" ;;
+      3) MODE="mainstage"; return ;;
+      *) echo -e "${RED}Invalid choice. Enter 1, 2, or 3.${NC}" ;;
     esac
   done
 }
@@ -102,12 +121,39 @@ find_cursor_cmd() {
   return 1
 }
 
-create_workspace_dir() {
-  local folder_name
-  folder_name="$(uuidgen | tr '[:upper:]' '[:lower:]')"
-  WORK_DIR="${HOME}/dev/${folder_name}"
+reset_workspace_dir() {
+  WORK_DIR="${HOME}/dev/graftcode_challenge"
+  if [[ -d "$WORK_DIR" ]]; then
+    rm -rf "$WORK_DIR"
+    echo -e "${YELLOW}Cleaned existing folder:${NC} ${WORK_DIR}"
+  fi
   mkdir -p "$WORK_DIR"
   echo -e "${GREEN}Created folder:${NC} ${WORK_DIR}"
+}
+
+stop_build_processes() {
+  local name
+  local stopped=false
+
+  echo
+  echo -e "${BOLD}Stopping esbuild and node processes...${NC}"
+
+  for name in esbuild node; do
+    if ! pgrep -x "$name" >/dev/null 2>&1; then
+      continue
+    fi
+
+    echo -e "${YELLOW}Stopping ${name} processes...${NC}"
+    pkill -9 "$name" 2>/dev/null || true
+    stopped=true
+  done
+
+  if [[ "$stopped" == true ]]; then
+    sleep 1
+    echo -e "${GREEN}Stopped esbuild and node processes.${NC}"
+  else
+    echo -e "${YELLOW}No esbuild or node processes running — skipping.${NC}"
+  fi
 }
 
 copy_challenge_template() {
@@ -139,7 +185,9 @@ setup_distributed_workspace() {
 
   cat > "${WORK_DIR}/.vscode/settings.json" <<'JSON'
 {
-  "task.allowAutomaticTasks": "on"
+  "task.allowAutomaticTasks": "on",
+  "workbench.editor.restoreViewState": false,
+  "files.hotExit": "off"
 }
 JSON
 
@@ -170,7 +218,7 @@ JSON
 
 cleanup_docker() {
   echo
-  echo -e "${BOLD}Cleaning up running Docker containers...${NC}"
+  echo -e "${BOLD}Cleaning up Docker containers and networks...${NC}"
 
   if ! command -v docker >/dev/null 2>&1; then
     echo -e "${YELLOW}Docker is not installed — skipping.${NC}"
@@ -182,16 +230,27 @@ cleanup_docker() {
     return 0
   fi
 
-  local running
-  running="$(docker ps -q 2>/dev/null || true)"
+  local containers
+  containers="$(docker ps -aq 2>/dev/null || true)"
 
-  if [[ -z "$running" ]]; then
-    echo -e "${YELLOW}No running containers.${NC}"
-    return 0
+  if [[ -n "$containers" ]]; then
+    # shellcheck disable=SC2086
+    docker rm -f $containers
+    echo -e "${GREEN}Removed Docker containers.${NC}"
+  else
+    echo -e "${YELLOW}No Docker containers.${NC}"
   fi
 
-  docker rm -f $running
-  echo -e "${GREEN}Removed running Docker containers.${NC}"
+  local networks
+  networks="$(docker network ls --format '{{.Name}}' 2>/dev/null | grep -v -E '^(bridge|host|none)$' || true)"
+
+  if [[ -n "$networks" ]]; then
+    # shellcheck disable=SC2086
+    docker network rm $networks 2>/dev/null || true
+    echo -e "${GREEN}Removed Docker networks.${NC}"
+  else
+    echo -e "${YELLOW}No custom Docker networks.${NC}"
+  fi
 }
 
 reset_mcp_file() {
@@ -456,6 +515,53 @@ quit_ide_if_running() {
   sleep 1
 }
 
+cleanup_cursor_workspace_session() {
+  local work_dir="${HOME}/dev/graftcode_challenge"
+  local workspace_file="${work_dir}/graftcode.code-workspace"
+  local storage_root="${HOME}/Library/Application Support/Cursor/User/workspaceStorage"
+  local projects_root="${HOME}/.cursor/projects"
+  local cleared=false
+
+  echo
+  echo -e "${BOLD}Clearing Cursor workspace session (tabs, editors)...${NC}"
+
+  if [[ -d "$storage_root" ]]; then
+    local entry workspace_json text
+    for entry in "$storage_root"/*; do
+      [[ -d "$entry" ]] || continue
+      workspace_json="${entry}/workspace.json"
+      [[ -f "$workspace_json" ]] || continue
+
+      text="$(cat "$workspace_json")"
+      if [[ "$text" != *"graftcode_challenge"* && "$text" != *"$work_dir"* && "$text" != *"$workspace_file"* ]]; then
+        continue
+      fi
+
+      rm -rf "$entry"
+      cleared=true
+      echo -e "${GREEN}Removed Cursor workspace storage:${NC} $(basename "$entry")"
+    done
+  fi
+
+  if [[ -d "$projects_root" ]]; then
+    local project_dir
+    for project_dir in "$projects_root"/*; do
+      [[ -d "$project_dir" ]] || continue
+      [[ "$(basename "$project_dir")" == *graftcode-challenge* || "$(basename "$project_dir")" == *graftcode_challenge* ]] || continue
+
+      rm -rf "$project_dir"
+      cleared=true
+      echo -e "${GREEN}Removed Cursor project data:${NC} $(basename "$project_dir")"
+    done
+  fi
+
+  if [[ "$cleared" == false ]]; then
+    echo -e "${YELLOW}No Cursor session data found for graftcode challenge — skipping.${NC}"
+  else
+    echo -e "${GREEN}Cursor session cleared.${NC}"
+  fi
+}
+
 cleanup_browser_cookies() {
   echo
   echo -e "${BOLD}Cleaning up IDE browser cookies...${NC}"
@@ -530,6 +636,89 @@ launch_distributed() {
   echo -e "Folder: ${CYAN}${WORK_DIR}${NC}"
 }
 
+prepare_challenge_environment() {
+  local ide="${1:-cursor}"
+
+  cleanup_docker
+  cleanup_mcp
+  cleanup_browser_cookies
+  cleanup_cursor_workspace_session
+  stop_build_processes
+  reset_workspace_dir
+  configure_ide_settings "$ide"
+  if [[ "$ide" == "cursor" ]]; then
+    configure_cursor_chat_panel_width
+  fi
+}
+
+start_docker_compose_up() {
+  local project_dir="$1"
+
+  if [[ ! -d "$project_dir" ]]; then
+    echo -e "${RED}Project folder not found: ${project_dir}${NC}" >&2
+    exit 1
+  fi
+
+  if [[ ! -f "${project_dir}/docker-compose.yml" && ! -f "${project_dir}/docker-compose.yaml" ]]; then
+    echo -e "${YELLOW}No docker-compose file in ${project_dir} — skipping.${NC}"
+    return 0
+  fi
+
+  if ! command -v docker >/dev/null 2>&1; then
+    echo -e "${YELLOW}Docker is not installed — skipping compose in ${project_dir}.${NC}"
+    return 0
+  fi
+
+  if ! docker info >/dev/null 2>&1; then
+    echo -e "${YELLOW}Docker is not running — skipping compose in ${project_dir}.${NC}"
+    return 0
+  fi
+
+  echo -e "${BOLD}Starting docker compose in ${project_dir}...${NC}"
+  (
+    cd "$project_dir"
+    docker compose up
+  ) &
+  echo -e "${GREEN}Docker compose started in ${project_dir}.${NC}"
+}
+
+launch_main_stage() {
+  local cursor_cmd project_dir
+
+  cursor_cmd="$(find_cursor_cmd)" || {
+    echo -e "${RED}Cursor not found. Install Cursor and add it to your PATH.${NC}" >&2
+    exit 1
+  }
+
+  for project_dir in "${MAIN_STAGE_PROJECTS[@]}"; do
+    if [[ ! -d "$project_dir" ]]; then
+      echo -e "${RED}Project folder not found: ${project_dir}${NC}" >&2
+      exit 1
+    fi
+  done
+
+  echo
+  echo -e "${BOLD}Launching Main Stage Session...${NC}"
+
+  for project_dir in "${MAIN_STAGE_PROJECTS[@]}"; do
+    echo -e "${BOLD}Opening Cursor in ${project_dir}${NC}"
+    "$cursor_cmd" -n "$project_dir" &
+    sleep 0.5
+  done
+
+  for project_dir in "${MAIN_STAGE_DOCKER_COMPOSE_PROJECTS[@]}"; do
+    start_docker_compose_up "$project_dir"
+  done
+
+  fullscreen_ide_window "cursor"
+
+  echo
+  echo -e "${GREEN}Done! Main Stage Session is ready.${NC}"
+  for project_dir in "${MAIN_STAGE_PROJECTS[@]}"; do
+    echo -e "  ${CYAN}${project_dir}${NC}"
+  done
+}
+
 run_challenge() {
   local ide_cmd
 
@@ -538,27 +727,20 @@ run_challenge() {
     echo -e "${RED}${IDE} not found. Install the IDE and add it to your PATH.${NC}" >&2
     exit 1
   }
-  create_workspace_dir
-  cleanup_docker
-  cleanup_mcp
-  cleanup_browser_cookies
-  configure_ide_settings "$IDE"
-  if [[ "$IDE" == "cursor" ]]; then
-    configure_cursor_chat_panel_width
-  fi
+  prepare_challenge_environment "$IDE"
   copy_challenge_template
   launch_challenge "$ide_cmd"
 }
 
 run_distributed() {
-  create_workspace_dir
-  cleanup_docker
-  cleanup_mcp
-  cleanup_browser_cookies
-  configure_ide_settings "cursor"
-  configure_cursor_chat_panel_width
+  prepare_challenge_environment "cursor"
   setup_distributed_workspace
   launch_distributed
+}
+
+run_main_stage() {
+  prepare_challenge_environment "cursor"
+  launch_main_stage
 }
 
 main() {
@@ -568,6 +750,7 @@ main() {
   case "$MODE" in
     challenge) run_challenge ;;
     distributed) run_distributed ;;
+    mainstage) run_main_stage ;;
   esac
 }
 
