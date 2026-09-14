@@ -23,7 +23,7 @@
       "id": "graftcodeBrowser",
       "type": "command",
       "command": "simpleBrowser.api.open",
-      "args": ["https://wad.graftcode.com"]
+      "args": ["https://conference.graftcode.com"]
     }
   ]
 }
