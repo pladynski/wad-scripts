@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 
 $ScriptDir = $PSScriptRoot
 $ChallengeTemplate = Join-Path $ScriptDir 'templates\graftcode-challenge'
-$GraftcodeUrl = 'https://wad.graftcode.com'
+$GraftcodeUrl = 'https://conference.graftcode.com'
 $WadKnowledgeRepo = 'https://github.com/pladynski/wad-knowledge'
 $WorkspaceMetadataCleanupDelay = 10
 $CursorChatPanelWidth = 400
