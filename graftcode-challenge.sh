@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHALLENGE_TEMPLATE="${SCRIPT_DIR}/templates/graftcode-challenge"
 
-GRAFTCODE_URL="https://wad.graftcode.com"
+GRAFTCODE_URL="https://conference.graftcode.com"
 WAD_KNOWLEDGE_REPO="https://github.com/pladynski/wad-knowledge"
 WORKSPACE_METADATA_CLEANUP_DELAY=10
 CURSOR_CHAT_PANEL_WIDTH=400
